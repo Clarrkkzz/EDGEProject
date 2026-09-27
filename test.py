@@ -26,7 +26,7 @@ prbs = {}
 bitrates = {}
 
 for i in range(0, N_UE):
-    id = env.insert_ue(0, starting_position=(random.randint(0, env.x_limit-1), random.randint(0, env.y_limit-1), 1), speed = 0, direction = random.randint(0, 359))
+    id = env.insert_ue(0, starting_position=(random.randint(0, env.x_limit-1), random.randint(0, env.y_limit-1), 1), speed = 2, direction = random.randint(0, 359))
     #id = env.insert_ue(0, starting_position=(0, 0, 1), speed = 0, direction = random.randint(0, 359))
     ue.append(id)
 
@@ -239,7 +239,7 @@ plt.title("Error")
 plt.plot(x,error)
 plt.show()
 
-'''
+
 for phone in ue:
 
     latency_dict = {}
@@ -263,4 +263,3 @@ for phone in ue:
 #print(phone1.current_position)
 #print(phone2.bs_bitrate_allocation)
 #print(phone2.current_position)
-'''
