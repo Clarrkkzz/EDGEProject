@@ -16,9 +16,11 @@ from typing import Dict, Optional
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 from matplotlib.widgets import Button
 
 import environment
+import util
 
 
 class InteractiveSimulator:
@@ -40,6 +42,13 @@ class InteractiveSimulator:
         self.connection_rates: Dict[int, float] = {}
         self.station_scores: Dict[int, Dict[int, float]] = {}
         self.handover_reason: Dict[int, str] = {}
+        self.obstacles = []
+        self.obstacle_mode = False
+        self.obstacle_width = 400
+        self.obstacle_height = 400
+        self.obstacle_penalty_db = 25
+        self.pending_ue_start = None
+        self.ue_mode = False
         self.step_number = 0
 
         self.figure, self.ax = plt.subplots(figsize=(10, 7))
@@ -50,6 +59,7 @@ class InteractiveSimulator:
         self.timer = self.figure.canvas.new_timer(interval=500)
         self.timer.add_callback(self.step)
         self.figure.canvas.mpl_connect("button_press_event", self.on_map_click)
+        self.figure.canvas.mpl_connect("button_release_event", self.on_map_release)
 
         self._create_controls()
         self._add_default_stations()
@@ -57,21 +67,87 @@ class InteractiveSimulator:
 
     def _create_controls(self) -> None:
         button_specs = [
-            ("Add base station", 0.03, self._add_random_station),
-            ("Start", 0.27, self.start),
-            ("Stop", 0.40, self.stop),
-            ("Reset", 0.53, self.reset),
+            ("Add base station", 0.03, 0.18, self._add_random_station),
+            ("Add UE", 0.22, 0.12, self._toggle_ue_mode),
+            ("Start", 0.36, 0.10, self.start),
+            ("Stop", 0.48, 0.10, self.stop),
+            ("Reset", 0.60, 0.10, self.reset),
+            ("Obstacle mode", 0.72, 0.12, self._toggle_obstacle_mode),
         ]
         self.buttons = []
-        for label, x, callback in button_specs:
-            button_ax = self.figure.add_axes((x, 0.04, 0.20 if x == 0.03 else 0.10, 0.06))
+        for label, x, width, callback in button_specs:
+            button_ax = self.figure.add_axes((x, 0.04, width, 0.06))
             button = Button(button_ax, label)
             button.on_clicked(callback)
             self.buttons.append(button)
 
+    def _toggle_ue_mode(self, _event=None) -> None:
+        if self.running:
+            self._draw(message="Stop the simulation before changing placement mode")
+            return
+        if not self.ue_mode and self.obstacle_mode:
+            self._draw(message="Disable obstacle mode before adding a UE")
+            return
+
+        self.ue_mode = not self.ue_mode
+        self.pending_ue_start = None
+        state = "enabled" if self.ue_mode else "disabled"
+        self._draw(message=f"Add UE mode {state}")
+
+    def _toggle_obstacle_mode(self, _event=None) -> None:
+        if self.running:
+            self._draw(message="Stop the simulation before changing placement mode")
+            return
+        if not self.obstacle_mode and self.ue_mode:
+            self._draw(message="Disable Add UE mode before adding obstacles")
+            return
+
+        self.obstacle_mode = not self.obstacle_mode
+        self.pending_ue_start = None
+        state = "enabled" if self.obstacle_mode else "disabled"
+        self._draw(message=f"Obstacle mode {state}")
+
+    def _segment_hits_obstacle(self, start, end, obstacle) -> bool:
+        """Approximate whether a UE-to-station line crosses an obstacle."""
+        x1, y1 = start
+        x2, y2 = end
+        xmin, ymin, xmax, ymax = obstacle
+
+        for index in range(21):
+            fraction = index / 20
+            x = x1 + fraction * (x2 - x1)
+            y = y1 + fraction * (y2 - y1)
+            if xmin <= x <= xmax and ymin <= y <= ymax:
+                return True
+        return False
+
+    def _apply_obstacles(self, ue_id: int, rsrp: Dict[int, float]) -> Dict[int, float]:
+        """Apply configured obstruction loss to terrestrial station signals."""
+        ue = self.env.ue_list[ue_id]
+        adjusted_rsrp = rsrp.copy()
+
+        for station_id in list(adjusted_rsrp):
+            station = self.env.bs_list[station_id]
+            if station.bs_type == "sat":
+                continue
+
+            for obstacle in self.obstacles:
+                if self._segment_hits_obstacle(
+                    ue.current_position,
+                    station.position,
+                    obstacle,
+                ):
+                    adjusted_rsrp[station_id] -= self.obstacle_penalty_db
+
+            if adjusted_rsrp[station_id] <= util.MIN_RSRP:
+                del adjusted_rsrp[station_id]
+
+        return adjusted_rsrp
+
     def _add_default_stations(self) -> None:
+        center_y = self.env.y_limit / 2
         self.env.place_LTE_base_station(
-            position=(800, 2000, 40),
+            position=(self.env.x_limit * 0.2, center_y, 40),
             carrier_frequency=1800,
             antenna_power=40,
             antenna_gain=15,
@@ -81,7 +157,7 @@ class InteractiveSimulator:
         )
 
         self.env.place_NR_base_station(
-            position=(2000, 2000, 40),
+            position=(self.env.x_limit * 0.5, center_y, 40),
             carrier_frequency=1900,
             numerology=1,
             antenna_power=30,
@@ -93,12 +169,15 @@ class InteractiveSimulator:
 
         self.env.place_SAT_base_station(
             total_bitrate=5000,
-            position=(3200, 2000),
+            position=(self.env.x_limit * 0.8, center_y),
         )
 
     def _add_random_station(self, _event=None) -> None:
         """Create an LTE, NR, or satellite station with valid random values."""
         if self.running:
+            return
+        if self.obstacle_mode or self.ue_mode:
+            self._draw(message="Disable placement mode before adding a station")
             return
 
         station_type = random.choice(("LTE", "NR", "SAT"))
@@ -143,6 +222,15 @@ class InteractiveSimulator:
         if event.xdata is None or event.ydata is None:
             return
 
+        if self.obstacle_mode:
+            xmin = max(0, event.xdata - self.obstacle_width / 2)
+            ymin = max(0, event.ydata - self.obstacle_height / 2)
+            xmax = min(self.env.x_limit, xmin + self.obstacle_width)
+            ymax = min(self.env.y_limit, ymin + self.obstacle_height)
+            self.obstacles.append((xmin, ymin, xmax, ymax))
+            self._draw(message="Obstacle added")
+            return
+
         for station in self.env.bs_list:
             distance = math.hypot(
                 station.position[0] - event.xdata,
@@ -168,16 +256,51 @@ class InteractiveSimulator:
         if self.running:
             return
 
+        if not self.ue_mode:
+            self._draw(message="Click Add UE before placing a new UE")
+            return
+
+        self.pending_ue_start = (event.xdata, event.ydata)
+        self._draw(message="Drag and release to set UE direction and speed")
+
+    def on_map_release(self, event) -> None:
+        """Create a UE using the drag vector as its direction and speed."""
+        if self.running or event.inaxes is not self.ax:
+            self.pending_ue_start = None
+            return
+        if self.pending_ue_start is None:
+            return
+        if event.xdata is None or event.ydata is None:
+            self.pending_ue_start = None
+            return
+
+        start_x, start_y = self.pending_ue_start
+        delta_x = event.xdata - start_x
+        delta_y = event.ydata - start_y
+        drag_distance = math.hypot(delta_x, delta_y)
+        self.pending_ue_start = None
+
+        if drag_distance < 20:
+            self._draw(message="Drag farther to place a moving UE")
+            return
+
+        direction = math.degrees(math.atan2(delta_y, delta_x)) % 360
+        speed = min(max(drag_distance / 10, 5), 100)
         ue_id = self.env.insert_ue(
             ue_class=0,
-            starting_position=(event.xdata, event.ydata, 1),
-            speed=50,
-            direction=0,
+            starting_position=(start_x, start_y, 1),
+            speed=speed,
+            direction=direction,
         )
         self.active_bs[ue_id] = None
         self.selected_ue = ue_id
         self.selected_bs = None
-        self._draw(message=f"Placed UE {ue_id}; click Start to connect it")
+        self._draw(
+            message=(
+                f"Placed UE {ue_id}; direction={direction:.1f} degrees, "
+                f"speed={speed:.1f} m/s"
+            )
+        )
 
     def start(self, _event=None) -> None:
         if self.running:
@@ -211,20 +334,12 @@ class InteractiveSimulator:
         self.__init__(width, height)
     
     def _select_station(self, ue_id: int, rsrp: Dict[int, float]) -> int:
-        """Select a station using signal, distance, load, and UE performance."""
-        ue = next(ue for ue in self.env.ue_list if ue.ue_id == ue_id)
+        """Select a station using signal, load, and UE performance."""
         current = self.active_bs.get(ue_id)
-        map_diagonal = math.hypot(self.env.x_limit, self.env.y_limit)
         scores = {}
 
         for station_id, signal in rsrp.items():
             station = self.env.bs_list[station_id]
-
-            distance = math.hypot(
-                ue.current_position[0] - station.position[0],
-                ue.current_position[1] - station.position[1],
-            )
-            distance_penalty = 8 * distance / map_diagonal
 
             load = station.allocated_bitrate / station.total_bitrate
             load = min(max(load, 0.0), 1.0)
@@ -233,7 +348,6 @@ class InteractiveSimulator:
 
             score = (
                 signal
-                - distance_penalty
                 - 12 * load
                 - 8 * utilization
                 + 8 * available_capacity
@@ -251,8 +365,21 @@ class InteractiveSimulator:
         self.station_scores[ue_id] = scores
         return max(scores, key=scores.get)
 
+    def _disconnect_ue(self, station_id: int, ue_id: int) -> None:
+        """Release a UE and keep the station's bitrate accounting consistent."""
+        station = self.env.bs_list[station_id]
+        allocated_rate = getattr(station, "ue_bitrate_allocation", {}).get(ue_id, 0)
+        station.request_disconnection(ue_id)
+        if hasattr(station, "ue_bitrate_allocation"):
+            station.ue_bitrate_allocation.pop(ue_id, None)
+        station.allocated_bitrate = max(
+            0,
+            station.allocated_bitrate - allocated_rate,
+        )
+
     def _update_ue(self, ue_id: int) -> None:
         rsrp = self.env.discover_bs(ue_id)
+        rsrp = self._apply_obstacles(ue_id, rsrp)
         self.visible_bs[ue_id] = rsrp
         if not rsrp:
             return
@@ -264,7 +391,7 @@ class InteractiveSimulator:
                 ue_id, self.requested_bitrate, rsrp
             )
         elif selected != current:
-            self.env.bs_list[current].request_disconnection(ue_id)
+            self._disconnect_ue(current, ue_id)
             allocated_rate = self.env.bs_list[selected].request_connection(
                 ue_id, self.requested_bitrate, rsrp
             )
@@ -299,6 +426,20 @@ class InteractiveSimulator:
         self.ax.set_ylabel("y position (m)")
         self.ax.set_title("Interactive Wireless Network Simulator")
 
+        for xmin, ymin, xmax, ymax in self.obstacles:
+            self.ax.add_patch(
+                Rectangle(
+                    (xmin, ymin),
+                    xmax - xmin,
+                    ymax - ymin,
+                    facecolor="dimgray",
+                    edgecolor="black",
+                    alpha=0.45,
+                    hatch="//",
+                    zorder=2,
+                )
+            )
+
         colors = {"sat": "darkorange", "lte": "royalblue", "nr": "seagreen"}
         for station in self.env.bs_list:
             x, y = station.position
@@ -314,7 +455,15 @@ class InteractiveSimulator:
                 linewidth=2 if selected else 1,
                 zorder=3,
             )
-            self.ax.text(x + 35, y + 35, f"BS {station.bs_id}\n{station.bs_type.upper()}", fontsize=8)
+            self.ax.text(
+                x + 35,
+                y + 35,
+                f"BS {station.bs_id}\n"
+                f"{station.bs_type.upper()}\n"
+                f"{station.allocated_bitrate:.1f}/"
+                f"{station.total_bitrate:.1f} Mbps",
+                fontsize=8,
+            )
 
         for ue in self.env.ue_list:
             x, y = ue.current_position
@@ -350,6 +499,18 @@ class InteractiveSimulator:
         ], loc="upper right", fontsize=8)
 
         lines = [message or ("Running" if self.running else "Stopped"), f"Step: {self.step_number}", ""]
+        lines.append("Base-station bitrate:")
+        for station in self.env.bs_list:
+            connected_ues = station.get_connected_users()
+            lines.append(
+                f"BS {station.bs_id} ({station.bs_type.upper()}): "
+                f"{station.allocated_bitrate:.1f}/"
+                f"{station.total_bitrate:.1f} Mbps, "
+                f"{station.compute_rbur():.1%} load, "
+                f"UEs={len(connected_ues)}"
+            )
+
+        lines.append("")
         for ue in self.env.ue_list:
             station_id = self.active_bs.get(ue.ue_id)
             rate = self.connection_rates.get(ue.ue_id, 0.0)
@@ -369,6 +530,7 @@ class InteractiveSimulator:
                     f"Position: ({selected_ue.current_position[0]:.1f}, "
                     f"{selected_ue.current_position[1]:.1f})",
                     f"Speed: {selected_ue.speed:.1f} m/s",
+                    f"Direction: {selected_ue.direction:.1f} degrees",
                     f"Requested: {selected_ue.requested_bitrate:.1f} Mbps",
                     f"Connected BS: {station_id}",
                     f"Handover: {self.handover_reason.get(selected_ue.ue_id, 'None')}",
